@@ -38,7 +38,7 @@ tf_cc_binary(
         "//tensorflow/core/profiler/internal:tfprof_stats",
         "//tensorflow/core/profiler/internal:tfprof_utils",
         "//tensorflow/core/profiler/internal/advisor:tfprof_advisor",
-        "@linenoise//:linenoise",
+        "@linenoise",
     ],
 )
 
@@ -57,7 +57,6 @@ tf_proto_library(
     name = "protos_all",
     srcs = glob(["**/*.proto"]),
     cc_api_version = 2,
-    go_api_version = 2,
     java_api_version = 2,
     protodeps = tf_additional_all_protos(),
     visibility = ["//visibility:public"],

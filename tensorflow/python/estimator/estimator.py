@@ -19,6 +19,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import collections
 import copy
 import os
 import tempfile
@@ -48,19 +49,24 @@ from tensorflow.python.saved_model import builder as saved_model_builder
 from tensorflow.python.saved_model import tag_constants
 from tensorflow.python.summary import summary
 from tensorflow.python.summary.writer import writer_cache
+from tensorflow.python.training import device_setter
 from tensorflow.python.training import evaluation
 from tensorflow.python.training import monitored_session
 from tensorflow.python.training import saver
 from tensorflow.python.training import training
 from tensorflow.python.training import training_util
+from tensorflow.python.training import warm_starting_util
 from tensorflow.python.util import compat
+from tensorflow.python.util import compat_internal
 from tensorflow.python.util import nest
+from tensorflow.python.util.tf_export import tf_export
 
 
 _VALID_MODEL_FN_ARGS = set(
     ['features', 'labels', 'mode', 'params', 'self', 'config'])
 
 
+@tf_export('estimator.Estimator')
 class Estimator(object):
   """Estimator class to train and evaluate TensorFlow models.
 
@@ -96,8 +102,21 @@ class Estimator(object):
   @end_compatibility
   """
 
-  def __init__(self, model_fn, model_dir=None, config=None, params=None):
+  def __init__(self, model_fn, model_dir=None, config=None, params=None,
+               warm_start_from=None):
     """Constructs an `Estimator` instance.
+
+    See @{$estimators} for more information. To warm-start an `Estimator`:
+
+    ```python
+    estimator = tf.estimator.DNNClassifier(
+        feature_columns=[categorical_feature_a_emb, categorical_feature_b_emb],
+        hidden_units=[1024, 512, 256],
+        warm_start_from="/path/to/checkpoint/dir")
+    ```
+
+    For more details on warm-start configuration, see
+    @{tf.estimator.WarmStartSettings$WarmStartSettings}.
 
     Args:
       model_fn: Model function. Follows the signature:
@@ -128,12 +147,19 @@ class Estimator(object):
 
       model_dir: Directory to save model parameters, graph and etc. This can
         also be used to load checkpoints from the directory into a estimator to
-        continue training a previously saved model. If `None`, the model_dir in
-        `config` will be used if set. If both are set, they must be same. If
-        both are `None`, a temporary directory will be used.
+        continue training a previously saved model. If `PathLike` object, the
+        path will be resolved. If `None`, the model_dir in `config` will be used
+        if set. If both are set, they must be same. If both are `None`, a
+        temporary directory will be used.
       config: Configuration object.
       params: `dict` of hyper parameters that will be passed into `model_fn`.
               Keys are names of parameters, values are basic python types.
+      warm_start_from: Optional string filepath to a checkpoint to warm-start
+                       from, or a `tf.estimator.WarmStartSettings` object to
+                       fully configure warm-starting.  If the string filepath is
+                       provided instead of a `WarmStartSettings`, then all
+                       variables are warm-started, and it is assumed that
+                       vocabularies and Tensor names are unchanged.
 
     Raises:
       RuntimeError: If eager execution is enabled.
@@ -141,7 +167,7 @@ class Estimator(object):
       ValueError: if this is called via a subclass and if that class overrides
         a member of `Estimator`.
     """
-    if context.in_eager_mode():
+    if context.executing_eagerly():
       raise RuntimeError(
           'Estimators are not supported when eager execution is enabled.')
 
@@ -158,6 +184,7 @@ class Estimator(object):
       self._config = config
 
     # Model directory.
+    model_dir = compat_internal.path_to_str(model_dir)
     if (model_dir is not None) and (self._config.model_dir is not None):
       if model_dir != self._config.model_dir:
         # TODO(alanyee): remove this suppression after it is no longer needed
@@ -189,6 +216,11 @@ class Estimator(object):
     _verify_model_fn_args(model_fn, params)
     self._model_fn = model_fn
     self._params = copy.deepcopy(params or {})
+
+    # pylint: disable=protected-access
+    self._warm_start_settings = _get_default_warm_start_settings(
+        warm_start_from)
+    # pylint: enable=protected-access
 
   @property
   def model_dir(self):
@@ -397,7 +429,8 @@ class Estimator(object):
               input_fn,
               predict_keys=None,
               hooks=None,
-              checkpoint_path=None):
+              checkpoint_path=None,
+              yield_single_examples=True):
     """Yields predictions for given features.
 
     Args:
@@ -423,13 +456,18 @@ class Estimator(object):
         inside the prediction call.
       checkpoint_path: Path of a specific checkpoint to predict. If `None`, the
         latest checkpoint in `model_dir` is used.
+      yield_single_examples: If False, yield the whole batch as returned by the
+        model_fn instead of decomposing the batch into individual elements. This
+        is useful if model_fn return some tensor with first dimension not
+        equal to the batch size
 
     Yields:
       Evaluated values of `predictions` tensors.
 
     Raises:
       ValueError: Could not find a trained model in model_dir.
-      ValueError: if batch length of predictions are not same.
+      ValueError: if batch length of predictions are not same and
+        yield_single_examples is True.
       ValueError: If there is a conflict between `predict_keys` and
         `predictions`. For example if `predict_keys` is not `None` but
         `EstimatorSpec.predictions` is not a `dict`.
@@ -450,15 +488,21 @@ class Estimator(object):
       estimator_spec = self._call_model_fn(
           features, None, model_fn_lib.ModeKeys.PREDICT, self.config)
       predictions = self._extract_keys(estimator_spec.predictions, predict_keys)
+      all_hooks = list(input_hooks)
+      all_hooks.extend(hooks)
+      all_hooks.extend(list(estimator_spec.prediction_hooks or []))
       with training.MonitoredSession(
           session_creator=training.ChiefSessionCreator(
               checkpoint_filename_with_path=checkpoint_path,
+              master=self._config.master,
               scaffold=estimator_spec.scaffold,
               config=self._session_config),
-          hooks=input_hooks + hooks) as mon_sess:
+          hooks=all_hooks) as mon_sess:
         while not mon_sess.should_stop():
           preds_evaluated = mon_sess.run(predictions)
-          if not isinstance(predictions, dict):
+          if not yield_single_examples:
+            yield preds_evaluated
+          elif not isinstance(predictions, dict):
             for pred in preds_evaluated:
               yield pred
           else:
@@ -470,9 +514,11 @@ class Estimator(object):
 
   def _assert_members_are_not_overridden(self):
     """Asserts members of `Estimator` are not overridden."""
-    allowed_overrides = set(['_call_input_fn', '_create_global_step',
-                             '_convert_train_steps_to_hooks',
-                             '_convert_eval_steps_to_hooks'])
+    allowed_overrides = set([
+        '_call_input_fn', '_create_global_step',
+        '_convert_train_steps_to_hooks', '_convert_eval_steps_to_hooks',
+        '_tf_api_names', '_validate_features_in_predict_input'
+    ])
     estimator_members = set([m for m in Estimator.__dict__.keys()
                              if not m.startswith('__')])
     subclass_members = set(self.__class__.__dict__.keys())
@@ -526,7 +572,7 @@ class Estimator(object):
       export_dir_base: A string containing a directory in which to create
         timestamped subdirectories containing exported SavedModels.
       serving_input_receiver_fn: A function that takes no argument and
-        returns a `ServingInputReceiver`.
+        returns a `ServingInputReceiver` or `TensorServingInputReceiver`.
       assets_extra: A dict specifying how to populate the assets.extra directory
         within the exported SavedModel, or `None` if no extra assets are needed.
       as_text: whether to write the SavedModel proto in text format.
@@ -581,7 +627,6 @@ class Estimator(object):
             sharded=True)
         saver_for_restore.restore(session, checkpoint_path)
 
-        # TODO(b/36111876): replace legacy_init_op with main_op mechanism
         # pylint: disable=protected-access
         local_init_op = (
             estimator_spec.scaffold.local_init_op or
@@ -625,11 +670,14 @@ class Estimator(object):
       # Unconditionally drop the label (the second element of result).
       result = result[0]
 
+    self._validate_features_in_predict_input(result)
+    return result, input_hooks
+
+  def _validate_features_in_predict_input(self, result):
     if not _has_dataset_or_queue_runner(result):
       logging.warning('Input graph does not use tf.data.Dataset or contain a '
                       'QueueRunner. That means predict yields forever. '
                       'This is probably a mistake.')
-    return result, input_hooks
 
   def _get_features_and_labels_from_input_fn(self, input_fn, mode):
     """Extracts the `features` and labels from return values of `input_fn`."""
@@ -677,7 +725,7 @@ class Estimator(object):
     """Creates the global step tensor in graph.
 
     The global step tensor must be an integer type with name 'global_step' and
-    be added to the collection ${tf.GraphKeys.GLOBAL_STEP}.
+    be added to the collection @{tf.GraphKeys.GLOBAL_STEP}.
 
     Args:
       graph: The graph in which to create the global step tensor.
@@ -778,6 +826,13 @@ class Estimator(object):
       worker_hooks.extend(input_hooks)
       estimator_spec = self._call_model_fn(
           features, labels, model_fn_lib.ModeKeys.TRAIN, self.config)
+
+      if self._warm_start_settings:
+        logging.info('Warm-starting with WarmStartSettings: %s' %
+                     (self._warm_start_settings,))
+        # pylint: disable=protected-access
+        warm_starting_util.warm_start(*self._warm_start_settings)
+        # pylint: enable=protected-access
       # Check if the user created a loss summary, and add one if they didn't.
       # We assume here that the summary is called 'loss'. If it is not, we will
       # make another one with the name 'loss' to ensure it shows up in the right
@@ -957,13 +1012,6 @@ def _get_replica_device_setter(config):
   Returns:
     A replica device setter, or None.
   """
-  ps_ops = [
-      'Variable', 'VariableV2', 'AutoReloadVariable', 'MutableHashTable',
-      'MutableHashTableV2', 'MutableHashTableOfTensors',
-      'MutableHashTableOfTensorsV2', 'MutableDenseHashTable',
-      'MutableDenseHashTableV2'
-  ]
-
   if config.task_type:
     worker_device = '/job:%s/task:%d' % (config.task_type, config.task_id)
   else:
@@ -974,7 +1022,7 @@ def _get_replica_device_setter(config):
         ps_tasks=config.num_ps_replicas,
         worker_device=worker_device,
         merge_devices=True,
-        ps_ops=ps_ops,
+        ps_ops=list(device_setter.STANDARD_PS_OPS),
         cluster=config.cluster_spec)
   else:
     return None
@@ -1064,7 +1112,7 @@ def _write_dict_to_summary(output_dir,
           isinstance(dictionary[key], np.int32) or
           isinstance(dictionary[key], int)):
       summary_proto.value.add(tag=key, simple_value=int(dictionary[key]))
-    elif isinstance(dictionary[key], six.string_types):
+    elif isinstance(dictionary[key], six.binary_type):
       try:
         summ = summary_pb2.Summary.FromString(dictionary[key])
         for i, _ in enumerate(summ.value):
@@ -1105,3 +1153,187 @@ class _DatasetInitializerHook(training.SessionRunHook):
   def after_create_session(self, session, coord):
     del coord
     session.run(self._initializer)
+
+VocabInfo = warm_starting_util.VocabInfo  # pylint: disable=invalid-name
+
+
+@tf_export('estimator.WarmStartSettings')
+class WarmStartSettings(
+    collections.namedtuple('WarmStartSettings', [
+        'ckpt_to_initialize_from',
+        'vars_to_warm_start',
+        'var_name_to_vocab_info',
+        'var_name_to_prev_var_name',
+    ])):
+  """Settings for warm-starting in Estimators.
+
+  Example Use with canned `DNNEstimator`:
+
+  ```
+  emb_vocab_file = tf.feature_column.embedding_column(
+      tf.feature_column.categorical_column_with_vocabulary_file(
+          "sc_vocab_file", "new_vocab.txt", vocab_size=100),
+      dimension=8)
+  emb_vocab_list = tf.feature_column.embedding_column(
+      tf.feature_column.categorical_column_with_vocabulary_list(
+          "sc_vocab_list", vocabulary_list=["a", "b"]),
+      dimension=8)
+  estimator = tf.estimator.DNNClassifier(
+    hidden_units=[128, 64], feature_columns=[emb_vocab_file, emb_vocab_list],
+    warm_start_from=ws)
+  ```
+
+  where `ws` could be defined as:
+
+  Warm-start all weights in the model (input layer and hidden weights).
+  Either the directory or a specific checkpoint can be provided (in the case
+  of the former, the latest checkpoint will be used):
+
+  ```
+  ws = WarmStartSettings(ckpt_to_initialize_from="/tmp")
+  ws = WarmStartSettings(ckpt_to_initialize_from="/tmp/model-1000")
+  ```
+
+  Warm-start only the embeddings (input layer):
+
+  ```
+  ws = WarmStartSettings(ckpt_to_initialize_from="/tmp",
+                         vars_to_warm_start=".*input_layer.*")
+  ```
+
+  Warm-start all weights but the embedding parameters corresponding to
+  `sc_vocab_file` have a different vocab from the one used in the current
+  model:
+
+  ```
+  vocab_info = tf.estimator.VocabInfo(
+      new_vocab=sc_vocab_file.vocabulary_file,
+      new_vocab_size=sc_vocab_file.vocabulary_size,
+      num_oov_buckets=sc_vocab_file.num_oov_buckets,
+      old_vocab="old_vocab.txt"
+  )
+  ws = WarmStartSettings(
+      ckpt_to_initialize_from="/tmp",
+      var_name_to_vocab_info={
+          "input_layer/sc_vocab_file_embedding/embedding_weights": vocab_info
+      })
+  ```
+
+  Warm-start only `sc_vocab_file` embeddings (and no other variables), which
+  have a different vocab from the one used in the current model:
+
+  ```
+  vocab_info = tf.estimator.VocabInfo(
+      new_vocab=sc_vocab_file.vocabulary_file,
+      new_vocab_size=sc_vocab_file.vocabulary_size,
+      num_oov_buckets=sc_vocab_file.num_oov_buckets,
+      old_vocab="old_vocab.txt"
+  )
+  ws = WarmStartSettings(
+      ckpt_to_initialize_from="/tmp",
+      vars_to_warm_start=None,
+      var_name_to_vocab_info={
+          "input_layer/sc_vocab_file_embedding/embedding_weights": vocab_info
+      })
+  ```
+
+  Warm-start all weights but the parameters corresponding to `sc_vocab_file`
+  have a different vocab from the one used in current checkpoint, and only
+  100 of those entries were used:
+
+  ```
+  vocab_info = tf.estimator.VocabInfo(
+      new_vocab=sc_vocab_file.vocabulary_file,
+      new_vocab_size=sc_vocab_file.vocabulary_size,
+      num_oov_buckets=sc_vocab_file.num_oov_buckets,
+      old_vocab="old_vocab.txt",
+      old_vocab_size=100
+  )
+  ws = WarmStartSettings(
+      ckpt_to_initialize_from="/tmp",
+      var_name_to_vocab_info={
+          "input_layer/sc_vocab_file_embedding/embedding_weights": vocab_info
+      })
+  ```
+
+  Warm-start all weights but the parameters corresponding to `sc_vocab_file`
+  have a different vocab from the one used in current checkpoint and the
+  parameters corresponding to `sc_vocab_list` have a different name from the
+  current checkpoint:
+
+  ```
+  vocab_info = tf.estimator.VocabInfo(
+      new_vocab=sc_vocab_file.vocabulary_file,
+      new_vocab_size=sc_vocab_file.vocabulary_size,
+      num_oov_buckets=sc_vocab_file.num_oov_buckets,
+      old_vocab="old_vocab.txt",
+      old_vocab_size=100
+  )
+  ws = WarmStartSettings(
+      ckpt_to_initialize_from="/tmp",
+      var_name_to_vocab_info={
+          "input_layer/sc_vocab_file_embedding/embedding_weights": vocab_info
+      },
+      var_name_to_prev_var_name={
+          "input_layer/sc_vocab_list_embedding/embedding_weights":
+              "old_tensor_name"
+      })
+  ```
+
+  Attributes:
+    ckpt_to_initialize_from: [Required] A string specifying the directory with
+      checkpoint file(s) or path to checkpoint from which to warm-start the
+      model parameters.
+    vars_to_warm_start: [Optional] A regular expression that captures which
+      variables to warm-start (see tf.get_collection).  Defaults to `'.*'`,
+      which warm-starts all variables.  If `None` is explicitly given, only
+      variables specified in `var_name_to_vocab_info` will be warm-started.
+    var_name_to_vocab_info: [Optional] Dict of variable names (strings) to
+      VocabInfo. The variable names should be "full" variables, not the names
+      of the partitions.  If not explicitly provided, the variable is assumed to
+      have no vocabulary.
+    var_name_to_prev_var_name: [Optional] Dict of variable names (strings) to
+      name of the previously-trained variable in `ckpt_to_initialize_from`. If
+      not explicitly provided, the name of the variable is assumed to be same
+      between previous checkpoint and current model.
+  """
+
+  def __new__(cls,
+              ckpt_to_initialize_from,
+              vars_to_warm_start='.*',
+              var_name_to_vocab_info=None,
+              var_name_to_prev_var_name=None):
+    if not ckpt_to_initialize_from:
+      raise ValueError(
+          '`ckpt_to_initialize_from` MUST be set in WarmStartSettings')
+    return super(WarmStartSettings, cls).__new__(
+        cls,
+        ckpt_to_initialize_from,
+        vars_to_warm_start,
+        var_name_to_vocab_info or {},
+        var_name_to_prev_var_name or {},
+    )
+
+
+def _get_default_warm_start_settings(warm_start_from):
+  """Returns default WarmStartSettings.
+
+  Args:
+    warm_start_from: Either a string representing the filepath of a checkpoint
+      to initialize from, or an instance of WarmStartSettings.
+
+  Returns:
+    Either None or an instance of WarmStartSettings.
+
+  Raises:
+    ValueError: If warm_start_from is not None but is neither a string nor an
+      instance of WarmStartSettings.
+  """
+  if warm_start_from is None:
+    return None
+  if isinstance(warm_start_from, six.string_types):
+    return WarmStartSettings(ckpt_to_initialize_from=warm_start_from)
+  elif isinstance(warm_start_from, WarmStartSettings):
+    return warm_start_from
+  else:
+    raise ValueError('warm_start_from must be a string or a WarmStartSettings')

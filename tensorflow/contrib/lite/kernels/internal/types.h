@@ -12,14 +12,30 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#ifndef THIRD_PARTY_TENSORFLOW_CONTRIB_LITE_KERNELS_INTERNAL_TYPES_H_
-#define THIRD_PARTY_TENSORFLOW_CONTRIB_LITE_KERNELS_INTERNAL_TYPES_H_
+#ifndef TENSORFLOW_CONTRIB_LITE_KERNELS_INTERNAL_TYPES_H_
+#define TENSORFLOW_CONTRIB_LITE_KERNELS_INTERNAL_TYPES_H_
 
 #include "tensorflow/contrib/lite/kernels/internal/compatibility.h"
 
 namespace tflite {
 
 enum class FusedActivationFunctionType : uint8 { kNone, kRelu6, kRelu1, kRelu };
+
+// Quantization parameters, determining the mapping of quantized values
+// to real values (i.e. determining how quantized values are mathematically
+// interpreted).
+//
+// The correspondence is as follows:
+//
+//   real_value = scale * (quantized_value - zero_point);
+//
+// In other words, zero_point designates which quantized value corresponds to
+// the real 0 value, and scale designates the difference between the real values
+// corresponding to consecutive quantized values differing by 1.
+struct QuantizationParams {
+  int32 zero_point = 0;
+  double scale = 0.0;
+};
 
 template <int N>
 struct Dims {
@@ -134,4 +150,4 @@ bool IsPackedWithoutStrides(const Dims<N>& dims) {
 
 }  // namespace tflite
 
-#endif  // THIRD_PARTY_TENSORFLOW_CONTRIB_LITE_KERNELS_INTERNAL_TYPES_H_
+#endif  // TENSORFLOW_CONTRIB_LITE_KERNELS_INTERNAL_TYPES_H_
